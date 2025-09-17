@@ -56,17 +56,54 @@ app.post("/shippo/webhook", async (req, res) => {
 
     console.log("✅ DELIVERED detected for:", tracking);
 
-    // 1) Pull metadata (if Shippo provided it), otherwise use fallback env vars
-const meta = safeJson(evt?.data?.metadata);
-let fulfillmentId = (meta?.kit_fulfillment_id || process.env.FALLBACK_FULFILLMENT_ID || "").trim();
-let orderGid = (meta?.shopify_order_gid || meta?.shopify_order_id || process.env.FALLBACK_ORDER_GID || "").trim();
+    // 1) Resolve order/fulfillment IDs automatically (no manual lookups)
+const rawMeta = evt?.data?.metadata;
+const meta = (typeof rawMeta === "string" && rawMeta.trim().startsWith("{")) ? safeJson(rawMeta) : (safeJson(rawMeta) || {});
 
+// Prefer explicit IDs if present (from Shippo metadata), else env fallbacks for testing
+let orderGid = (meta.shopify_order_gid || meta.shopify_order_id || process.env.FALLBACK_ORDER_GID || "").trim();
+let fulfillmentId = (meta.kit_fulfillment_id || process.env.FALLBACK_FULFILLMENT_ID || "").trim();
 
-
-    if (!fulfillmentId) {
-      console.error("❌ Missing kit_fulfillment_id in Shippo metadata");
-      return res.sendStatus(200);
+// If missing, try to parse "Order #1234" from Shippo's metadata string and look up via Shopify
+if ((!orderGid || !fulfillmentId) && typeof rawMeta === "string") {
+  const m = rawMeta.match(/Order\s*#(\d+)/i);
+  if (m && m[1]) {
+    const orderName = `#${m[1]}`;
+    const LOOKUP_QUERY = `
+      query($q: String!) {
+        orders(first: 1, query: $q) {
+          edges {
+            node {
+              id
+              fulfillments {
+                id
+                status
+                createdAt
+              }
+            }
+          }
+        }
+      }`;
+    const d = await shopifyGQL(LOOKUP_QUERY, { q: `name:${orderName}` });
+    const node = d?.orders?.edges?.[0]?.node;
+    if (node?.id) {
+      if (!orderGid) orderGid = (node.id || "").trim();
+      // Pick the newest fulfillment (createdAt desc)
+      const fulf = Array.isArray(node.fulfillments) ? [...node.fulfillments] : [];
+      if (!fulfillmentId && fulf.length) {
+        fulf.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        fulfillmentId = (fulf[0].id || "").trim();
+      }
     }
+  }
+}
+
+// Final guardrails
+if (!orderGid || !fulfillmentId) {
+  console.error("❌ Could not resolve order/fulfillment automatically. metadata =", rawMeta);
+  return res.sendStatus(200);
+}
+
 
     // 2) If order GID isn't in metadata, look it up from the fulfillment
     if (!orderGid) {
