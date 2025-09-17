@@ -58,7 +58,6 @@ app.post("/shippo/webhook", async (req, res) => {
       ? safeJson(rawMeta)
       : (safeJson(rawMeta) || {});
 
-    // Prefer explicit IDs if present (from Shippo metadata), else env fallbacks for testing
     let orderGid = (meta.shopify_order_gid || meta.shopify_order_id || process.env.FALLBACK_ORDER_GID || "").trim();
     let fulfillmentId = (meta.kit_fulfillment_id || process.env.FALLBACK_FULFILLMENT_ID || "").trim();
 
@@ -67,7 +66,7 @@ app.post("/shippo/webhook", async (req, res) => {
       const m = rawMeta.match(/Order\s*#(\d+)/i);
       if (m && m[1]) {
         const orderName = `#${m[1]}`;
-        const LOOKUP_QUERY = 
+        const LOOKUP_QUERY = `
           query($q: String!) {
             orders(first: 1, query: $q) {
               edges {
@@ -81,7 +80,7 @@ app.post("/shippo/webhook", async (req, res) => {
                 }
               }
             }
-          };
+          }`;
         const d = await shopifyGQL(LOOKUP_QUERY, { q: `name:${orderName}` });
         const node = d?.orders?.edges?.[0]?.node;
         if (node?.id) {
@@ -104,7 +103,7 @@ app.post("/shippo/webhook", async (req, res) => {
 
     // 2) If order GID still isn't set (edge case), resolve from fulfillment
     if (!orderGid) {
-      const q = 
+      const Q_F_FROM_ID = `
         query($id: ID!) {
           node(id: $id) {
             ... on Fulfillment {
@@ -112,8 +111,8 @@ app.post("/shippo/webhook", async (req, res) => {
               order { id }
             }
           }
-        };
-      const data = await shopifyGQL(q, { id: fulfillmentId });
+        }`;
+      const data = await shopifyGQL(Q_F_FROM_ID, { id: fulfillmentId });
       orderGid = (data?.node?.order?.id || "").trim();
       if (!orderGid) {
         console.error("❌ Could not resolve order GID from fulfillment:", fulfillmentId);
@@ -121,53 +120,57 @@ app.post("/shippo/webhook", async (req, res) => {
       }
     }
 
-    // 3) Add a tag to the order (so your email template can key off order.tags)
-    await shopifyGQL(
-      
-      mutation {
-        tagsAdd(id: "${orderGid}", tags: ["${KIT_RETURN_TAG}"]) {
+    // 3) Add a tag to the order
+    const M_TAG_ADD = `
+      mutation($id: ID!, $tags: [String!]!) {
+        tagsAdd(id: $id, tags: $tags) {
           userErrors { field message }
         }
-      }
-    );
+      }`;
+    await shopifyGQL(M_TAG_ADD, { id: orderGid, tags: [KIT_RETURN_TAG] });
     console.log("🏷️ Tag added to order:", orderGid, KIT_RETURN_TAG);
 
-    // 4) Update tracking on the kit fulfillment and SEND the native Shopify email
-    // Build url fragment safely (omit when empty)
-    const urlFragment = evt?.data?.tracking_url ? `, url: "${evt.data.tracking_url}"` : "";
-    await shopifyGQL(
-      
-      mutation {
+    // 4) Update tracking + notify (omit url if blank)
+    const info = {
+      number: tracking || "KIT-RETURN",
+      company: "Kit Return"
+    };
+    if (evt?.data?.tracking_url) info.url = evt.data.tracking_url;
+
+    const M_TRACK_UPDATE = `
+      mutation M($fulfillmentId: ID!, $info: FulfillmentTrackingInput!, $notify: Boolean!) {
         fulfillmentTrackingInfoUpdateV2(
-          fulfillmentId: "${fulfillmentId}",
-          trackingInfoInput: {
-            number: "${tracking || "KIT-RETURN"}",
-            company: "Kit Return"${urlFragment}
-          },
-          notifyCustomer: true
+          fulfillmentId: $fulfillmentId,
+          trackingInfoInput: $info,
+          notifyCustomer: $notify
         ) {
           fulfillment { id }
           userErrors { field message }
         }
-      }
-    );
+      }`;
+    await shopifyGQL(M_TRACK_UPDATE, {
+      fulfillmentId,
+      info,
+      notify: true
+    });
     console.log("📧 Native Shopify notification sent for fulfillment:", fulfillmentId);
 
-    // 5) (Optional) Also record a Delivered event on the fulfillment timeline
+    // 5) Delivered event
     const happenedAt = evt?.data?.tracking_status?.status_date || new Date().toISOString();
-    await shopifyGQL(
-      
-      mutation {
-        fulfillmentEventCreate(fulfillmentEvent: {
-          fulfillmentId: "${fulfillmentId}",
-          status: DELIVERED,
-          happenedAt: "${happenedAt}",
-          message: "Impression kit returned"
-        }) {
+    const M_EVENT = `
+      mutation($input: FulfillmentEventInput!) {
+        fulfillmentEventCreate(fulfillmentEvent: $input) {
           userErrors { field message }
         }
+      }`;
+    await shopifyGQL(M_EVENT, {
+      input: {
+        fulfillmentId,
+        status: "DELIVERED",
+        happenedAt,
+        message: "Impression kit returned"
       }
-    );
+    });
     console.log("🕒 Fulfillment Delivered event recorded.");
 
     res.sendStatus(200);
